@@ -6,6 +6,10 @@ import {
 } from '../../utils/spacePreviewToken';
 import { isSeparatePreviewDomain } from '../../utils/urls';
 import { AppService } from '../../database/services/AppService';
+import { RateLimitService } from '../../services/rate-limit/rateLimits';
+import { getGlobalConfigurableSettings } from '../../config';
+import { RateLimitExceededError } from 'shared/types/errors';
+import { JWTUtils } from '../../utils/jwtUtils';
 
 const SPACE_PREVIEW_ROUTE_PATTERN = /^\/space\/([^/]+)\/preview\/([^/]+)(?:\/.*)?$/;
 
@@ -61,7 +65,7 @@ async function forwardToSpacePreview(
 	}
 }
 
-export function createPreviewAccessResponse(status: 401 | 403, title: string, message: string): Response {
+export function createPreviewAccessResponse(status: 401 | 403 | 429, title: string, message: string): Response {
 	return new Response(
 		`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title}</title><style>body{margin:0;font-family:Inter,system-ui,sans-serif;background:#0b1020;color:#e5e7eb;display:flex;align-items:center;justify-content:center;min-height:100vh;padding:24px}.card{max-width:480px;background:#111827;border:1px solid #374151;border-radius:12px;padding:24px;box-shadow:0 20px 45px rgba(0,0,0,.35)}h1{margin:0 0 12px;font-size:24px}p{margin:0;color:#cbd5e1;line-height:1.5}</style></head><body><div class="card"><h1>${title}</h1><p>${message}</p></div></body></html>`,
 		{
@@ -93,6 +97,31 @@ async function isPreviewVersionCurrent(
 }
 
 /**
+ * Enforce a per-preview-token rate limit. SpaceDO previews are dispatched
+ * outside the Hono chain, so the global API limiter does not apply here.
+ * Returns a `429` Response when the limit is exceeded, otherwise `null`.
+ * The limiter is keyed by a hash of the token (never the raw token).
+ */
+async function enforcePreviewRateLimit(
+	env: Env,
+	token: string,
+	request: Request,
+): Promise<Response | null> {
+	try {
+		const config = await getGlobalConfigurableSettings(env);
+		const tokenId = await JWTUtils.getInstance(env).hashToken(token);
+		await RateLimitService.enforceSpacePreviewRateLimit(env, config.security.rateLimit, tokenId, request);
+		return null;
+	} catch (error) {
+		if (error instanceof RateLimitExceededError) {
+			return createPreviewAccessResponse(429, 'Too many requests', 'This preview is receiving too many requests. Please slow down and try again shortly.');
+		}
+		// Fail open on unexpected limiter errors — do not block a legit preview.
+		return null;
+	}
+}
+
+/**
  * Unified, token-only preview auth. A request is authorized if it carries a
  * valid path/branch-scoped preview cookie, or a valid `?t=` token (which then
  * bootstraps the cookie). No session cookie / DB ownership check (claims-only),
@@ -113,6 +142,8 @@ export async function handleSpacePreview(
 	if (cookieToken) {
 		const claims = await verifySpacePreviewToken(env, cookieToken, spaceName, branch);
 		if (claims && (await isPreviewVersionCurrent(env, spaceName, claims))) {
+			const limited = await enforcePreviewRateLimit(env, cookieToken, request);
+			if (limited) return limited;
 			return forwardToSpacePreview(request, env, spaceName);
 		}
 	}
@@ -122,6 +153,8 @@ export async function handleSpacePreview(
 	if (queryToken) {
 		const claims = await verifySpacePreviewToken(env, queryToken, spaceName, branch);
 		if (claims && (await isPreviewVersionCurrent(env, spaceName, claims))) {
+			const limited = await enforcePreviewRateLimit(env, queryToken, request);
+			if (limited) return limited;
 			const response = await forwardToSpacePreview(request, env, spaceName);
 			if (isWebSocketResponse(response)) {
 				return response;
