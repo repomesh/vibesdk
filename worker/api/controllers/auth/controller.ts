@@ -18,7 +18,8 @@ import {
     mapUserResponse,
     setSecureAuthCookies,
 	clearAuthCookies,
-	extractSessionId
+	extractSessionId,
+	validateRedirectUrl
 } from '../../../utils/authUtils';
 import { JWTUtils } from '../../../utils/jwtUtils';
 import { RouteContext } from '../../types/route-context';
@@ -26,6 +27,15 @@ import { authMiddleware } from '../../../middleware/auth/auth';
 import { CsrfService } from '../../../services/csrf/CsrfService';
 import { BaseController } from '../baseController';
 import { createLogger } from '../../../logger';
+import {
+	buildOAuthNonceCookie,
+	buildClearOAuthNonceCookie,
+	buildTokenCookie,
+} from '../../../utils/oauthCookie';
+import { encryptTokens, type EncryptedTokenData } from '../../../utils/tokenEncryption';
+import { CloudflareConnectOAuthProvider } from '../../../services/oauth/cloudflare-connect';
+import { CloudflareProvisioningService } from '../../../services/cloudflare/CloudflareProvisioningService';
+import { isCloudflareGatewayLimitsEnabled } from '../../../services/rate-limit';
 /**
  * Authentication Controller
  */
@@ -36,7 +46,8 @@ export class AuthController extends BaseController {
      */
     static hasOAuthProviders(env: Env): boolean {
         return (!!env.GOOGLE_CLIENT_ID && !!env.GOOGLE_CLIENT_SECRET) || 
-               (!!env.GITHUB_CLIENT_ID && !!env.GITHUB_CLIENT_SECRET);
+               (!!env.GITHUB_CLIENT_ID && !!env.GITHUB_CLIENT_SECRET) ||
+               CloudflareConnectOAuthProvider.isLoginConfigured(env);
     }
     
     /**
@@ -60,13 +71,6 @@ export class AuthController extends BaseController {
 
             const validatedData = registerSchema.parse(bodyResult.data);
 
-            if (env.ALLOWED_EMAIL && validatedData.email !== env.ALLOWED_EMAIL) {
-                return AuthController.createErrorResponse(
-                    'Email Whitelisting is enabled. Please use the allowed email to register.',
-                    403
-                );
-            }
-            
             const authService = new AuthService(env);
             const result = await authService.register(validatedData, request);
             
@@ -115,13 +119,6 @@ export class AuthController extends BaseController {
 
             const validatedData = loginSchema.parse(bodyResult.data);
 
-            if (env.ALLOWED_EMAIL && validatedData.email !== env.ALLOWED_EMAIL) {
-                return AuthController.createErrorResponse(
-                    'Email Whitelisting is enabled. Please use the allowed email to login.',
-                    403
-                );
-            }
-            
             const authService = new AuthService(env);
             const result = await authService.login(validatedData, request);
             
@@ -282,13 +279,21 @@ export class AuthController extends BaseController {
             const intendedRedirectUrl = routeContext.queryParams.get('redirect_url') || undefined;
             
             const authService = new AuthService(env);
-            const authUrl = await authService.getOAuthAuthorizationUrl(
+            const { authUrl, nonce } = await authService.getOAuthAuthorizationUrl(
                 validatedProvider,
                 request,
                 intendedRedirectUrl
             );
-            
-            return Response.redirect(authUrl, 302);
+
+            // Set the state nonce as an HttpOnly cookie so the callback can verify the
+            // flow was initiated by this same browser (login-CSRF defense).
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    Location: authUrl,
+                    'Set-Cookie': buildOAuthNonceCookie(env, nonce),
+                },
+            });
         } catch (error) {
             this.logger.error('OAuth initiation failed', error);
             
@@ -297,6 +302,97 @@ export class AuthController extends BaseController {
             }
             
             return AuthController.handleError(error, 'initiate OAuth');
+        }
+    }
+
+    /**
+     * Initiate an authenticated account-link flow for the current user.
+     * GET /api/auth/link/:provider
+     */
+    static async initiateProviderLink(request: Request, env: Env, _ctx: ExecutionContext, routeContext: RouteContext): Promise<Response> {
+        try {
+            const user = routeContext.user;
+            if (!user) {
+                return AuthController.createErrorResponse('Unauthorized', 401);
+            }
+
+            const validatedProvider = oauthProviderSchema.parse(routeContext.pathParams.provider);
+
+            const authService = new AuthService(env);
+            const { authUrl, nonce } = await authService.getOAuthAuthorizationUrl(
+                validatedProvider,
+                request,
+                '/settings',
+                user.id
+            );
+
+            return new Response(null, {
+                status: 302,
+                headers: {
+                    Location: authUrl,
+                    'Set-Cookie': buildOAuthNonceCookie(env, nonce),
+                },
+            });
+        } catch (error) {
+            this.logger.error('Provider link initiation failed', error);
+            if (error instanceof SecurityError) {
+                return AuthController.createErrorResponse(error.message, error.statusCode);
+            }
+            return AuthController.handleError(error, 'initiate provider link');
+        }
+    }
+
+    /**
+     * List the current user's linked OAuth identities.
+     * GET /api/auth/identities
+     */
+    static async getLinkedIdentities(_request: Request, env: Env, _ctx: ExecutionContext, routeContext: RouteContext): Promise<Response> {
+        try {
+            const user = routeContext.user;
+            if (!user) {
+                return AuthController.createErrorResponse('Unauthorized', 401);
+            }
+
+            const authService = new AuthService(env);
+            const identities = await authService.getUserIdentities(user.id);
+
+            return AuthController.createSuccessResponse({
+                identities: identities.map((identity) => ({
+                    provider: identity.provider,
+                    email: identity.email,
+                    emailVerified: !!identity.emailVerified,
+                    createdAt: identity.createdAt,
+                })),
+            });
+        } catch (error) {
+            return AuthController.handleError(error, 'get linked identities');
+        }
+    }
+
+    /**
+     * Unlink an OAuth identity from the current user.
+     * DELETE /api/auth/identities/:provider
+     */
+    static async unlinkProvider(_request: Request, env: Env, _ctx: ExecutionContext, routeContext: RouteContext): Promise<Response> {
+        try {
+            const user = routeContext.user;
+            if (!user) {
+                return AuthController.createErrorResponse('Unauthorized', 401);
+            }
+
+            const validatedProvider = oauthProviderSchema.parse(routeContext.pathParams.provider);
+
+            const authService = new AuthService(env);
+            await authService.unlinkOAuthIdentity(user.id, validatedProvider);
+
+            return AuthController.createSuccessResponse({
+                message: 'Provider unlinked successfully',
+            });
+        } catch (error) {
+            if (error instanceof SecurityError) {
+                return AuthController.createErrorResponse(error.message, error.statusCode);
+            }
+            return AuthController.handleError(error, 'unlink provider');
         }
     }
     
@@ -324,6 +420,45 @@ export class AuthController extends BaseController {
             }
             
             const authService = new AuthService(env);
+            const baseOrigin = new URL(request.url).origin;
+
+            // Account-link flow: the state was bound to a user at initiation time.
+            // Re-authenticate the browser session and require it to match before
+            // attaching the identity. No new session is minted.
+            const linkUserId = await authService.getPendingLinkUserId(validatedProvider, state);
+            if (linkUserId) {
+                const session = await authMiddleware(request, env);
+                if (!session || session.user.id !== linkUserId) {
+                    return Response.redirect(`${baseOrigin}/settings?error=link_unauthorized`, 302);
+                }
+
+                try {
+                    const linkResult = await authService.completeOAuthLink(
+                        validatedProvider,
+                        code,
+                        state,
+                        request,
+                        session.user.id
+                    );
+                    const safeLinkRedirect = linkResult.redirectUrl
+                        ? validateRedirectUrl(linkResult.redirectUrl, request)
+                        : null;
+                    const location = safeLinkRedirect || `${baseOrigin}/settings?linked=${validatedProvider}`;
+                    const response = new Response(null, {
+                        status: 302,
+                        headers: { 'Location': location }
+                    });
+                    response.headers.append('Set-Cookie', buildClearOAuthNonceCookie(env));
+                    return response;
+                } catch (error) {
+                    this.logger.error('OAuth link failed', error);
+                    const reason = error instanceof SecurityError && error.statusCode === 409
+                        ? 'link_conflict'
+                        : 'link_failed';
+                    return Response.redirect(`${baseOrigin}/settings?error=${reason}`, 302);
+                }
+            }
+
             const result = await authService.handleOAuthCallback(
                 validatedProvider,
                 code,
@@ -333,8 +468,12 @@ export class AuthController extends BaseController {
             
             const baseUrl = new URL(request.url).origin;
             
-            // Use stored redirect URL or default to home page
-            const redirectLocation = result.redirectUrl || `${baseUrl}/`;
+            // Defense-in-depth: never trust the stored redirect blindly. Re-validate it
+            // at callback time and fall back to home if it is unsafe.
+            const safeRedirect = result.redirectUrl
+                ? validateRedirectUrl(result.redirectUrl, request)
+                : null;
+            const redirectLocation = safeRedirect || `${baseUrl}/`;
             
             // Create redirect response with secure auth cookies
             const response = new Response(null, {
@@ -347,6 +486,27 @@ export class AuthController extends BaseController {
             setSecureAuthCookies(response, {
                 accessToken: result.accessToken,
             });
+
+            // The state nonce cookie has served its purpose; clear it.
+            response.headers.append('Set-Cookie', buildClearOAuthNonceCookie(env));
+
+            // Cloudflare login: best-effort auto-connect the AI Gateway in the same
+            // round-trip so the user does not need a separate Connect step. Only attempt
+            // it when the gateway feature is enabled (which requires CF_OAUTH_ENCRYPTION_KEY
+            // to encrypt the token cookie); identity login works without it. Any failure
+            // here must NOT break identity login.
+            if (
+                validatedProvider === 'cloudflare' &&
+                result.oauthTokens?.accessToken &&
+                isCloudflareGatewayLimitsEnabled(env)
+            ) {
+                await AuthController.autoConnectCloudflareGateway(
+                    env,
+                    result.user.id,
+                    result.oauthTokens,
+                    response,
+                );
+            }
             
             return response;
         } catch (error) {
@@ -749,16 +909,18 @@ export class AuthController extends BaseController {
             const providers = {
                 google: !!env.GOOGLE_CLIENT_ID && !!env.GOOGLE_CLIENT_SECRET,
                 github: !!env.GITHUB_CLIENT_ID && !!env.GITHUB_CLIENT_SECRET,
+                cloudflare: CloudflareConnectOAuthProvider.isLoginConfigured(env),
                 email: true
             };
+            const hasOAuth = providers.google || providers.github || providers.cloudflare;
             
             // Include CSRF token with provider info
             const csrfToken = CsrfService.getOrGenerateToken(request, false);
             
             const response = AuthController.createSuccessResponse({
                 providers,
-                hasOAuth: providers.google || providers.github,
-                requiresEmailAuth: !providers.google && !providers.github,
+                hasOAuth,
+                requiresEmailAuth: !hasOAuth,
                 csrfToken,
                 csrfExpiresIn: Math.floor(CsrfService.defaults.tokenTTL / 1000)
             });
@@ -771,6 +933,47 @@ export class AuthController extends BaseController {
         } catch (error) {
             this.logger.error('Get auth providers error', error);
             return AuthController.createErrorResponse('Failed to get authentication providers', 500);
+        }
+    }
+
+    /**
+     * Best-effort AI Gateway auto-connect for the Cloudflare login flow.
+     *
+     * Encrypts the provider tokens (bound to the user) into the `__Host-cf_oauth_token`
+     * cookie and provisions the user's gateways using the same shared service as the
+     * standalone connect flow. Any failure is logged and swallowed so identity login
+     * always succeeds even if gateway scopes or provisioning are unavailable.
+     */
+    private static async autoConnectCloudflareGateway(
+        env: Env,
+        userId: string,
+        tokens: { accessToken: string; refreshToken?: string; expiresIn?: number; tokenType: string },
+        response: Response,
+    ): Promise<void> {
+        try {
+            // Provision accounts/gateways from the freshly-minted access token.
+            const provisioning = new CloudflareProvisioningService(env);
+            await provisioning.provisionFromToken(tokens.accessToken, userId);
+
+            // Encrypt tokens (bound to this user) and install the HttpOnly token cookie.
+            const expiresAt = Date.now() + (tokens.expiresIn || 3600) * 1000;
+            const tokenData: EncryptedTokenData = {
+                accessToken: tokens.accessToken,
+                refreshToken: tokens.refreshToken,
+                expiresAt,
+                tokenType: tokens.tokenType,
+                userId,
+            };
+            const encryptedBlob = await encryptTokens(tokenData, env);
+            response.headers.append('Set-Cookie', buildTokenCookie(env, encryptedBlob));
+
+            this.logger.info('Cloudflare login auto-connect succeeded', { userId });
+        } catch (error) {
+            // Identity login must still succeed; the user falls back to free tier + Connect.
+            this.logger.warn('Cloudflare login auto-connect failed (continuing with identity login)', {
+                userId,
+                error: error instanceof Error ? error.message : String(error),
+            });
         }
     }
 }

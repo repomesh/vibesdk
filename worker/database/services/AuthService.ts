@@ -12,7 +12,9 @@ import { ApiKeyService } from './ApiKeyService';
 import { PasswordService } from '../../utils/passwordService';
 import { GoogleOAuthProvider } from '../../services/oauth/google';
 import { GitHubOAuthProvider } from '../../services/oauth/github';
+import { CloudflareConnectOAuthProvider } from '../../services/oauth/cloudflare-connect';
 import { BaseOAuthProvider } from '../../services/oauth/base';
+import { readOAuthNonceCookie } from '../../utils/oauthCookie';
 import { 
     SecurityError, 
     SecurityErrorType 
@@ -23,7 +25,7 @@ import {
     AuthUser, 
     OAuthProvider
 } from '../../types/auth-types';
-import { mapUserResponse, validateRedirectUrl } from '../../utils/authUtils';
+import { mapUserResponse, validateRedirectUrl, enforceAllowedEmail } from '../../utils/authUtils';
 import { createLogger } from '../../logger';
 import { validateEmail, validatePassword } from '../../utils/validationUtils';
 import { extractRequestMetadata } from '../../utils/authUtils';
@@ -71,6 +73,9 @@ export class AuthService extends BaseService {
      */
     async register(data: RegistrationData, request: Request): Promise<AuthResult> {
         try {
+            // Deployment-level admission gate (ALLOWED_EMAIL)
+            enforceAllowedEmail(this.env, data.email, 'register');
+
             // Validate email format using centralized utility
             const emailValidation = validateEmail(data.email);
             if (!emailValidation.valid) {
@@ -181,6 +186,9 @@ export class AuthService extends BaseService {
      */
     async login(credentials: LoginCredentials, request: Request): Promise<AuthResult> {
         try {
+            // Deployment-level admission gate (ALLOWED_EMAIL)
+            enforceAllowedEmail(this.env, credentials.email, 'login');
+
             // Find user
             const user = await this.database
                 .select()
@@ -273,6 +281,8 @@ export class AuthService extends BaseService {
                 return GoogleOAuthProvider.create(this.env, url);
             case 'github':
                 return GitHubOAuthProvider.create(this.env, url);
+            case 'cloudflare':
+                return CloudflareConnectOAuthProvider.createForLogin(this.env, url);
             default:
                 throw new SecurityError(
                     SecurityErrorType.INVALID_INPUT,
@@ -288,8 +298,9 @@ export class AuthService extends BaseService {
     async getOAuthAuthorizationUrl(
         provider: OAuthProvider,
         request: Request,
-        intendedRedirectUrl?: string
-    ): Promise<string> {
+        intendedRedirectUrl?: string,
+        linkUserId?: string
+    ): Promise<{ authUrl: string; nonce: string }> {
         const oauthProvider = await this.getOauthProvider(provider, request);
         if (!oauthProvider) {
             throw new SecurityError(
@@ -313,6 +324,12 @@ export class AuthService extends BaseService {
         
         // Generate PKCE code verifier
         const codeVerifier = BaseOAuthProvider.generateCodeVerifier();
+
+        // Generate a nonce that binds this state to the initiating browser. It is
+        // stored here and also set as an HttpOnly cookie by the controller; the
+        // callback rejects any request whose cookie nonce does not match. This is
+        // the core defense against login CSRF / session fixation.
+        const nonce = generateSecureToken();
         
         // Store OAuth state with intended redirect URL
         await this.database.insert(schema.oauthStates).values({
@@ -325,8 +342,8 @@ export class AuthService extends BaseService {
             expiresAt: new Date(Date.now() + 600000), // 10 minutes
             isUsed: false,
             scopes: [],
-            userId: null,
-            nonce: null
+            userId: linkUserId ?? null,
+            nonce
         });
         
         // Get authorization URL
@@ -334,7 +351,7 @@ export class AuthService extends BaseService {
         
         logger.info('OAuth authorization initiated', { provider });
         
-        return authUrl;
+        return { authUrl, nonce };
     }
     
     /**
@@ -359,6 +376,84 @@ export class AuthService extends BaseService {
     }
     
     /**
+     * Validate an OAuth state row (existence, expiry, browser nonce) and mark it as
+     * used. Shared by the login callback and the account-link callback.
+     */
+    private async validateAndConsumeOAuthState(
+        provider: OAuthProvider,
+        state: string,
+        request: Request
+    ): Promise<schema.OAuthState> {
+        const now = new Date();
+        const oauthState = await this.database
+            .select()
+            .from(schema.oauthStates)
+            .where(
+                and(
+                    eq(schema.oauthStates.state, state),
+                    eq(schema.oauthStates.provider, provider),
+                    eq(schema.oauthStates.isUsed, false)
+                )
+            )
+            .get();
+
+        if (!oauthState || new Date(oauthState.expiresAt) < now) {
+            throw new SecurityError(
+                SecurityErrorType.CSRF_VIOLATION,
+                'Invalid or expired OAuth state',
+                400
+            );
+        }
+
+        // Bind the state to the initiating browser via the nonce cookie. A callback
+        // replayed in a different browser (login CSRF / session fixation) will not
+        // carry the matching nonce and is rejected here.
+        const cookieNonce = readOAuthNonceCookie(request, this.env);
+        if (!oauthState.nonce || !cookieNonce || cookieNonce !== oauthState.nonce) {
+            logger.warn('OAuth callback nonce mismatch - possible login CSRF', {
+                provider,
+                hasStoredNonce: !!oauthState.nonce,
+                hasCookieNonce: !!cookieNonce,
+            });
+            throw new SecurityError(
+                SecurityErrorType.CSRF_VIOLATION,
+                'Invalid or expired OAuth state',
+                400
+            );
+        }
+
+        // Mark state as used
+        await this.database
+            .update(schema.oauthStates)
+            .set({ isUsed: true })
+            .where(eq(schema.oauthStates.id, oauthState.id));
+
+        return oauthState;
+    }
+
+    /**
+     * Look up whether a still-valid, unused OAuth state is bound to a user (i.e. an
+     * account-link flow). Returns the bound userId or null. Does not consume state.
+     */
+    async getPendingLinkUserId(
+        provider: OAuthProvider,
+        state: string
+    ): Promise<string | null> {
+        const row = await this.database
+            .select({ userId: schema.oauthStates.userId })
+            .from(schema.oauthStates)
+            .where(
+                and(
+                    eq(schema.oauthStates.state, state),
+                    eq(schema.oauthStates.provider, provider),
+                    eq(schema.oauthStates.isUsed, false)
+                )
+            )
+            .get();
+        return row?.userId ?? null;
+    }
+
+    /**
      * Handle OAuth callback
      */
     async handleOAuthCallback(
@@ -377,33 +472,18 @@ export class AuthService extends BaseService {
                 );
             }
             
-            // Verify state
-            const now = new Date();
-            const oauthState = await this.database
-                .select()
-                .from(schema.oauthStates)
-                .where(
-                    and(
-                        eq(schema.oauthStates.state, state),
-                        eq(schema.oauthStates.provider, provider),
-                        eq(schema.oauthStates.isUsed, false)
-                    )
-                )
-                .get();
-            
-            if (!oauthState || new Date(oauthState.expiresAt) < now) {
+            // Validate the state (existence, expiry, browser nonce) and mark it used.
+            const oauthState = await this.validateAndConsumeOAuthState(provider, state, request);
+
+            // A state bound to a user is an account-link flow and must go through
+            // completeOAuthLink (which re-checks the session), never the login path.
+            if (oauthState.userId) {
                 throw new SecurityError(
                     SecurityErrorType.CSRF_VIOLATION,
-                    'Invalid or expired OAuth state',
+                    'Invalid OAuth state for login',
                     400
                 );
             }
-            
-            // Mark state as used
-            await this.database
-                .update(schema.oauthStates)
-                .set({ isUsed: true })
-                .where(eq(schema.oauthStates.id, oauthState.id));
             
             // Exchange code for tokens
             const tokens = await oauthProvider.exchangeCodeForTokens(
@@ -413,7 +493,11 @@ export class AuthService extends BaseService {
             
             // Get user info
             const oauthUserInfo = await oauthProvider.getUserInfo(tokens.accessToken);
-            
+
+            // Deployment-level admission gate (ALLOWED_EMAIL). Enforced BEFORE any
+            // user row or session is created so a rejected email never gets admitted.
+            enforceAllowedEmail(this.env, oauthUserInfo.email, 'oauth');
+
             // Find or create user
             const user = await this.findOrCreateOAuthUser(provider, oauthUserInfo);
             
@@ -433,7 +517,10 @@ export class AuthService extends BaseService {
                 accessToken: sessionAccessToken,
                 sessionId: session.sessionId,
                 expiresAt: session.expiresAt,
-                redirectUrl: oauthState.redirectUri || undefined
+                redirectUrl: oauthState.redirectUri || undefined,
+                // Surface raw provider tokens only for Cloudflare so the controller can
+                // best-effort auto-connect the AI Gateway in the same round-trip.
+                oauthTokens: provider === 'cloudflare' ? tokens : undefined,
             };
         } catch (error) {
             await this.logAuthAttempt('', `oauth_${provider}`, false, request);
@@ -452,64 +539,308 @@ export class AuthService extends BaseService {
     }
     
     /**
-     * Find or create OAuth user
+     * Resolve the user for an OAuth login.
+     *
+     * An OAuth login is a request to authenticate as a (provider, providerId)
+     * identity, NOT as an email address. Lookup therefore happens against the
+     * user_oauth_identities table. Binding an OAuth identity to an existing
+     * account only happens through the authenticated link flow (linkOAuthIdentity),
+     * never implicitly by email match — that implicit bind was the account-takeover
+     * vector this method previously had.
      */
     private async findOrCreateOAuthUser(
         provider: OAuthProvider,
         oauthUserInfo: OAuthUserInfo
     ): Promise<schema.User> {
-        // Check if user exists with this email
-        let user = await this.database
+        // Fail closed unless the provider asserts the email is verified.
+        if (oauthUserInfo.emailVerified !== true) {
+            throw new SecurityError(
+                SecurityErrorType.UNAUTHORIZED,
+                'OAuth provider did not verify the email address',
+                401
+            );
+        }
+
+        const email = oauthUserInfo.email.toLowerCase();
+
+        // 1. Identity-first lookup: match by (provider, providerId).
+        const identity = await this.database
             .select()
-            .from(schema.users)
-            .where(eq(schema.users.email, oauthUserInfo.email.toLowerCase()))
+            .from(schema.userOauthIdentities)
+            .where(
+                and(
+                    eq(schema.userOauthIdentities.provider, provider),
+                    eq(schema.userOauthIdentities.providerId, oauthUserInfo.id)
+                )
+            )
             .get();
-        
-        if (!user) {
-            // Create new user
-            const userId = generateId();
+
+        if (identity) {
             const now = new Date();
-            
-            await this.database.insert(schema.users).values({
-                id: userId,
-                email: oauthUserInfo.email.toLowerCase(),
-                displayName: oauthUserInfo.name || oauthUserInfo.email.split('@')[0],
-                avatarUrl: oauthUserInfo.picture,
-                emailVerified: oauthUserInfo.emailVerified || false,
-                provider: provider,
-                providerId: oauthUserInfo.id,
-                createdAt: now,
-                updatedAt: now
-            });
-            
-            user = await this.database
-                .select()
-                .from(schema.users)
-                .where(eq(schema.users.id, userId))
-                .get();
-        } else {
-            // Always update OAuth info and user data on login
+            // Refresh the identity's cached email/verification.
+            await this.database
+                .update(schema.userOauthIdentities)
+                .set({ email, emailVerified: true, updatedAt: now })
+                .where(eq(schema.userOauthIdentities.id, identity.id));
+
+            // Refresh profile fields on the user, but never the primary
+            // provider/providerId binding.
             await this.database
                 .update(schema.users)
                 .set({
-                    displayName: oauthUserInfo.name || user.displayName,
-                    avatarUrl: oauthUserInfo.picture || user.avatarUrl,
-                    provider: provider,
-                    providerId: oauthUserInfo.id,
-                    emailVerified: oauthUserInfo.emailVerified || user.emailVerified,
-                    updatedAt: new Date()
+                    displayName: oauthUserInfo.name || undefined,
+                    avatarUrl: oauthUserInfo.picture || undefined,
+                    updatedAt: now
                 })
-                .where(eq(schema.users.id, user.id));
-            
-            // Refresh user data after updates
-            user = await this.database
+                .where(eq(schema.users.id, identity.userId));
+
+            const user = await this.database
                 .select()
                 .from(schema.users)
-                .where(eq(schema.users.id, user.id))
+                .where(eq(schema.users.id, identity.userId))
                 .get();
+
+            if (!user) {
+                throw new SecurityError(
+                    SecurityErrorType.UNAUTHORIZED,
+                    'OAuth authentication failed',
+                    500
+                );
+            }
+            return user;
         }
-        
+
+        // 2. No identity match. If a user already exists with this email (local
+        //    signup or a different provider), refuse to silently take it over.
+        const emailRow = await this.database
+            .select()
+            .from(schema.users)
+            .where(eq(schema.users.email, email))
+            .get();
+
+        if (emailRow) {
+            throw new SecurityError(
+                SecurityErrorType.CONFLICT,
+                'An account with this email already exists. Sign in with your existing method, then link this provider from settings.',
+                409
+            );
+        }
+
+        // 3. Brand-new identity: create the user and its first identity row.
+        return this.createOAuthUser(provider, oauthUserInfo);
+    }
+
+    /**
+     * Create a new user from a verified OAuth identity, writing both the users
+     * row (primary identity, for display/back-compat) and its user_oauth_identities row.
+     */
+    private async createOAuthUser(
+        provider: OAuthProvider,
+        oauthUserInfo: OAuthUserInfo
+    ): Promise<schema.User> {
+        const userId = generateId();
+        const now = new Date();
+        const email = oauthUserInfo.email.toLowerCase();
+
+        await this.database.insert(schema.users).values({
+            id: userId,
+            email,
+            displayName: oauthUserInfo.name || email.split('@')[0],
+            avatarUrl: oauthUserInfo.picture,
+            emailVerified: true,
+            provider,
+            providerId: oauthUserInfo.id,
+            createdAt: now,
+            updatedAt: now
+        });
+
+        await this.database.insert(schema.userOauthIdentities).values({
+            id: generateId(),
+            userId,
+            provider,
+            providerId: oauthUserInfo.id,
+            email,
+            emailVerified: true,
+            createdAt: now,
+            updatedAt: now
+        });
+
+        const user = await this.database
+            .select()
+            .from(schema.users)
+            .where(eq(schema.users.id, userId))
+            .get();
+
         return user!;
+    }
+
+    /**
+     * Complete an authenticated account-link callback: validate the state, verify
+     * it is bound to the acting user, and attach the (provider, providerId) identity.
+     */
+    async completeOAuthLink(
+        provider: OAuthProvider,
+        code: string,
+        state: string,
+        request: Request,
+        sessionUserId: string
+    ): Promise<{ userId: string; provider: OAuthProvider; redirectUrl?: string }> {
+        const oauthProvider = await this.getOauthProvider(provider, request);
+        if (!oauthProvider) {
+            throw new SecurityError(
+                SecurityErrorType.INVALID_INPUT,
+                `OAuth provider ${provider} not configured`,
+                400
+            );
+        }
+
+        const oauthState = await this.validateAndConsumeOAuthState(provider, state, request);
+
+        // The state must have been created by (and for) the acting session's user.
+        if (!oauthState.userId || oauthState.userId !== sessionUserId) {
+            throw new SecurityError(
+                SecurityErrorType.CSRF_VIOLATION,
+                'Invalid account-link state',
+                403
+            );
+        }
+
+        const tokens = await oauthProvider.exchangeCodeForTokens(
+            code,
+            oauthState.codeVerifier || undefined
+        );
+        const oauthUserInfo = await oauthProvider.getUserInfo(tokens.accessToken);
+
+        await this.linkOAuthIdentity(oauthState.userId, provider, oauthUserInfo);
+
+        return {
+            userId: oauthState.userId,
+            provider,
+            redirectUrl: oauthState.redirectUri || undefined
+        };
+    }
+
+    /**
+     * Attach a verified OAuth identity to an existing user. Rejects if the identity
+     * is already bound to a different user.
+     */
+    async linkOAuthIdentity(
+        userId: string,
+        provider: OAuthProvider,
+        oauthUserInfo: OAuthUserInfo
+    ): Promise<void> {
+        if (oauthUserInfo.emailVerified !== true) {
+            throw new SecurityError(
+                SecurityErrorType.UNAUTHORIZED,
+                'OAuth provider did not verify the email address',
+                401
+            );
+        }
+
+        const email = oauthUserInfo.email.toLowerCase();
+        const now = new Date();
+
+        const existing = await this.database
+            .select()
+            .from(schema.userOauthIdentities)
+            .where(
+                and(
+                    eq(schema.userOauthIdentities.provider, provider),
+                    eq(schema.userOauthIdentities.providerId, oauthUserInfo.id)
+                )
+            )
+            .get();
+
+        if (existing) {
+            if (existing.userId !== userId) {
+                throw new SecurityError(
+                    SecurityErrorType.CONFLICT,
+                    'This provider account is already linked to another user.',
+                    409
+                );
+            }
+            // Already linked to this user; just refresh the cached email.
+            await this.database
+                .update(schema.userOauthIdentities)
+                .set({ email, emailVerified: true, updatedAt: now })
+                .where(eq(schema.userOauthIdentities.id, existing.id));
+            return;
+        }
+
+        await this.database.insert(schema.userOauthIdentities).values({
+            id: generateId(),
+            userId,
+            provider,
+            providerId: oauthUserInfo.id,
+            email,
+            emailVerified: true,
+            createdAt: now,
+            updatedAt: now
+        });
+
+        logger.info('OAuth identity linked', { userId, provider });
+    }
+
+    /**
+     * List the OAuth identities linked to a user.
+     */
+    async getUserIdentities(userId: string): Promise<schema.UserOauthIdentity[]> {
+        return this.database
+            .select()
+            .from(schema.userOauthIdentities)
+            .where(eq(schema.userOauthIdentities.userId, userId))
+            .all();
+    }
+
+    /**
+     * Remove a linked OAuth identity. Refuses to remove the user's only remaining
+     * login method (must keep at least one identity or a password).
+     */
+    async unlinkOAuthIdentity(userId: string, provider: OAuthProvider): Promise<void> {
+        const identities = await this.getUserIdentities(userId);
+        const target = identities.find((i) => i.provider === provider);
+
+        if (!target) {
+            throw new SecurityError(
+                SecurityErrorType.INVALID_INPUT,
+                'No linked identity found for this provider.',
+                404
+            );
+        }
+
+        const user = await this.database
+            .select()
+            .from(schema.users)
+            .where(eq(schema.users.id, userId))
+            .get();
+
+        const hasPassword = !!user?.passwordHash;
+        const remainingIdentities = identities.length - 1;
+        if (remainingIdentities < 1 && !hasPassword) {
+            throw new SecurityError(
+                SecurityErrorType.INVALID_INPUT,
+                'Cannot remove your only login method.',
+                400
+            );
+        }
+
+        await this.database
+            .delete(schema.userOauthIdentities)
+            .where(eq(schema.userOauthIdentities.id, target.id));
+
+        // If the removed identity was the primary one on the users row, repoint the
+        // primary to another remaining identity so display/back-compat stays coherent.
+        if (user && user.provider === provider) {
+            const next = identities.find((i) => i.provider !== provider);
+            if (next) {
+                await this.database
+                    .update(schema.users)
+                    .set({ provider: next.provider, providerId: next.providerId, updatedAt: new Date() })
+                    .where(eq(schema.users.id, userId));
+            }
+        }
+
+        logger.info('OAuth identity unlinked', { userId, provider });
     }
     
     /**
@@ -526,7 +857,7 @@ export class AuthService extends BaseService {
             
             await this.database.insert(schema.authAttempts).values({
                 identifier: identifier.toLowerCase(),
-                attemptType: attemptType as 'login' | 'register' | 'oauth_google' | 'oauth_github' | 'refresh' | 'reset_password',
+                attemptType: attemptType as 'login' | 'register' | 'oauth_google' | 'oauth_github' | 'oauth_cloudflare' | 'refresh' | 'reset_password',
                 success: success,
                 ipAddress: requestMetadata.ipAddress
             });
@@ -560,6 +891,9 @@ export class AuthService extends BaseService {
      */
     async verifyEmailWithOtp(email: string, otp: string, request: Request): Promise<AuthResult> {
         try {
+            // Deployment-level admission gate (ALLOWED_EMAIL)
+            enforceAllowedEmail(this.env, email, 'login');
+
             // Find valid OTP
             const storedOtp = await this.database
                 .select()
