@@ -11,6 +11,7 @@ declare namespace Cloudflare {
 		ALLOWED_EMAIL: "";
 		DISPATCH_NAMESPACE: "vibesdk-default-namespace";
 		ENABLE_READ_REPLICAS: "true";
+		ENABLE_EMAIL_AUTH: string;
 		CLOUDFLARE_AI_GATEWAY: "vibesdk-gateway";
 		PLATFORM_CAPABILITIES: {"features":{"app":{"enabled":true},"presentation":{"enabled":false},"general":{"enabled":false}},"version":"1.0.0"};
 		ANTHROPIC_API_KEY: string;

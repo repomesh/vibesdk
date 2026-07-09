@@ -56,7 +56,7 @@ export function LoginModal({
 	actionContext,
 	showCloseButton = true,
 }: LoginModalProps) {
-	const { authProviders, hasOAuth, requiresEmailAuth } = useAuth();
+	const { authProviders, hasOAuth } = useAuth();
 	const [mode, setMode] = useState<AuthMode>('login');
 	const [showPassword, setShowPassword] = useState(false);
 	const [isLoading, setIsLoading] = useState(false);
@@ -72,9 +72,12 @@ export function LoginModal({
 		Record<string, string>
 	>({});
 
-	// Determine if enhanced features are available
-	const hasEmailAuth = requiresEmailAuth && !!onEmailLogin;
-	const hasRegistration = requiresEmailAuth && !!onRegister;
+	// Determine if enhanced features are available. Email/password auth is offered
+	// whenever the backend reports the email provider is enabled, independently of
+	// whether any OAuth provider is also configured.
+	const emailAuthEnabled = authProviders?.email ?? true;
+	const hasEmailAuth = emailAuthEnabled && !!onEmailLogin;
+	const hasRegistration = emailAuthEnabled && !!onRegister;
 	const showGitHub = authProviders?.github && hasOAuth;
 	const showGoogle = authProviders?.google && hasOAuth;
 	const showCloudflare = authProviders?.cloudflare && hasOAuth;

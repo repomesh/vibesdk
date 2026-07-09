@@ -36,19 +36,12 @@ import { encryptTokens, type EncryptedTokenData } from '../../../utils/tokenEncr
 import { CloudflareConnectOAuthProvider } from '../../../services/oauth/cloudflare-connect';
 import { CloudflareProvisioningService } from '../../../services/cloudflare/CloudflareProvisioningService';
 import { isCloudflareGatewayLimitsEnabled } from '../../../services/rate-limit';
+import { isEmailAuthEnabled } from '../../../utils/envs';
 /**
  * Authentication Controller
  */
 export class AuthController extends BaseController {
     static logger = createLogger('AuthController');
-    /**
-     * Check if OAuth providers are configured
-     */
-    static hasOAuthProviders(env: Env): boolean {
-        return (!!env.GOOGLE_CLIENT_ID && !!env.GOOGLE_CLIENT_SECRET) || 
-               (!!env.GITHUB_CLIENT_ID && !!env.GITHUB_CLIENT_SECRET) ||
-               CloudflareConnectOAuthProvider.isLoginConfigured(env);
-    }
     
     /**
      * Register a new user
@@ -56,10 +49,9 @@ export class AuthController extends BaseController {
      */
     static async register(request: Request, env: Env, _ctx: ExecutionContext, _routeContext: RouteContext): Promise<Response> {
         try {
-            // Check if OAuth providers are configured - if yes, block email/password registration
-            if (AuthController.hasOAuthProviders(env)) {
+            if (!isEmailAuthEnabled(env)) {
                 return AuthController.createErrorResponse(
-                    'Email/password registration is not available when OAuth providers are configured. Please use OAuth login instead.',
+                    'Email/password authentication is disabled on this deployment.',
                     403
                 );
             }
@@ -97,17 +89,16 @@ export class AuthController extends BaseController {
             return AuthController.handleError(error, 'register user');
         }
     }
-    
+
     /**
      * Login with email and password
      * POST /api/auth/login
      */
     static async login(request: Request, env: Env, _ctx: ExecutionContext, _routeContext: RouteContext): Promise<Response> {
         try {
-            // Check if OAuth providers are configured - if yes, block email/password login
-            if (AuthController.hasOAuthProviders(env)) {
+            if (!isEmailAuthEnabled(env)) {
                 return AuthController.createErrorResponse(
-                    'Email/password login is not available when OAuth providers are configured. Please use OAuth login instead.',
+                    'Email/password authentication is disabled on this deployment.',
                     403
                 );
             }
@@ -512,7 +503,10 @@ export class AuthController extends BaseController {
         } catch (error) {
             this.logger.error('OAuth callback failed', error);
             const baseUrl = new URL(request.url).origin;
-            return Response.redirect(`${baseUrl}/?error=auth_failed`, 302);
+            const reason = error instanceof SecurityError && error.statusCode === 409
+                ? 'email_exists'
+                : 'auth_failed';
+            return Response.redirect(`${baseUrl}/?error=${reason}`, 302);
         }
     }
 
@@ -910,7 +904,7 @@ export class AuthController extends BaseController {
                 google: !!env.GOOGLE_CLIENT_ID && !!env.GOOGLE_CLIENT_SECRET,
                 github: !!env.GITHUB_CLIENT_ID && !!env.GITHUB_CLIENT_SECRET,
                 cloudflare: CloudflareConnectOAuthProvider.isLoginConfigured(env),
-                email: true
+                email: isEmailAuthEnabled(env)
             };
             const hasOAuth = providers.google || providers.github || providers.cloudflare;
             
